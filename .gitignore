@@ -1,0 +1,23 @@
+# Node dependencies
+node_modules/
+
+# Python byte-code / optimized / DLL files (legacy/)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (legacy/)
+.env
+.venv/
+venv/
+env/
+
+# OS-specific files
+.DS_Store
+
+# IDE settings
+.vscode/
+.idea/
+
+# Project-specific state & configuration
+config.json
