@@ -6,9 +6,10 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { after, before, describe, test } = require('node:test');
 
+const PROJECT_DIR = path.resolve(__dirname, '..');
 const TMP_CONFIG = path.join(__dirname, 'tmp-config');
-const AGENT_SCRIPT = path.join(__dirname, 'mock_agent.py');
-const SERVER_SCRIPT = path.join(__dirname, 'server.js');
+const AGENT_SCRIPT = path.join(PROJECT_DIR, 'mock_agent.py');
+const SERVER_SCRIPT = path.join(PROJECT_DIR, 'server.js');
 
 const HTTP_PORT = 8316;
 const AGENT1_PORT = 8081;
@@ -21,6 +22,20 @@ let agent2Proc;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForAgent(port, timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/hello`);
+      if (res.ok) return;
+    } catch {
+      // not ready yet
+    }
+    await sleep(50);
+  }
+  throw new Error(`Mock agent on port ${port} failed to start within ${timeoutMs}ms`);
 }
 
 before(async () => {
@@ -38,8 +53,11 @@ before(async () => {
   agent1Proc = spawn('python3', [AGENT_SCRIPT, '--port', AGENT1_PORT, '--name', 'mock-pi', '--type', 'pi'], { stdio: 'ignore' });
   agent2Proc = spawn('python3', [AGENT_SCRIPT, '--port', AGENT2_PORT, '--name', 'mock-pico', '--type', 'pico'], { stdio: 'ignore' });
 
-  // Give agents time to start
-  await sleep(1000);
+  // Wait for both mock agents to be ready
+  await Promise.all([
+    waitForAgent(AGENT1_PORT),
+    waitForAgent(AGENT2_PORT)
+  ]);
 });
 
 after(() => {
@@ -60,7 +78,15 @@ class HttpClient {
 
   async start() {
     this.proc = spawn('node', [SERVER_SCRIPT, '--http', '--port', String(HTTP_PORT), '--config', TMP_CONFIG, '--no-scan'], { stdio: 'inherit' });
-    await sleep(1000); // Give server time to bind
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      try {
+        await fetch(this.endpoint, { method: 'POST', headers: this.headers, body: '{}' });
+        break;
+      } catch {
+        await sleep(50);
+      }
+    }
 
     const init = await this.request('initialize', {
       protocolVersion: '2024-11-05',
