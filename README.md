@@ -1,10 +1,12 @@
 # ctrlPi MCP Bridge
 
+[![Platform: Cross-Platform](https://img.shields.io/badge/platform-Cross--Platform-006400.svg)](#requirements)
+[![Version 0.9.24](https://img.shields.io/badge/version-0.9.24-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
 [![Node 20+](https://img.shields.io/badge/node-20%2B-blue.svg)](https://nodejs.org/)
-[![Version 0.9.23](https://img.shields.io/badge/version-0.9.23-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
-[![Protocol: MCP](https://img.shields.io/badge/protocol-MCP-006400.svg)](#tools)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Agents: Pi & Pico](https://img.shields.io/badge/agents-Pi%20%26%20Pico-006400.svg)](#requirements)
+[![Protocol: MCP](https://img.shields.io/badge/protocol-MCP-006400.svg)](#tools)
+[![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
 ![Status: Beta](https://img.shields.io/badge/status-Beta-red.svg)
 [![Build Status](https://github.com/ctrlpi/mcp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/ctrlpi/mcp-bridge/actions)
 
@@ -272,4 +274,4 @@ npm test
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+[MIT](http://localhost:8181/LICENSE)

@@ -1,14 +1,13 @@
 {
   "name": "@ctrlpi/mcp-bridge",
-  "version": "0.9.23",
+  "version": "0.9.24",
   "description": "An MCP (Model Context Protocol) server that lets an AI agent (e.g. Claude Desktop) control one or more GPIO agents - `pi-gpio-api` Pis or `pico-gpio-api` Pico Ws - by calling their REST API over HTTP.",
   "main": "server.js",
   "files": [
     "server.js",
-    "test.js",
+    "test",
     "mock_agent.py",
-    "CLAUDE.md",
-    "TESTING_PLAYBOOK.md"
+    "CLAUDE.md"
   ],
   "bin": {
     "mcp-bridge": "server.js"
@@ -16,7 +15,7 @@
   "scripts": {
     "start": "node server.js",
     "run": "node server.js",
-    "test": "node --test test.js"
+    "test": "node --test test/mcp-bridge.test.js"
   },
   "repository": {
     "type": "git",
