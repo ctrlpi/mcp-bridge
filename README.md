@@ -1,10 +1,10 @@
 # ctrlPi MCP Bridge
 
 [![Platform: Cross-Platform](https://img.shields.io/badge/platform-Cross--Platform-006400.svg)](#requirements)
-[![Version 0.9.24](https://img.shields.io/badge/version-0.9.24-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
+[![Version 0.9.26](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
 [![Node 20+](https://img.shields.io/badge/node-20%2B-blue.svg)](https://nodejs.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
-[![Agents: Pi & Pico](https://img.shields.io/badge/agents-Pi%20%26%20Pico-006400.svg)](#requirements)
+[![Agents: Pi, Pico & ESP32](https://img.shields.io/badge/agents-Pi%2C%20Pico%20%26%20ESP32-006400.svg)](#requirements)
 [![Protocol: MCP](https://img.shields.io/badge/protocol-MCP-006400.svg)](#tools)
 [![License: MIT](https://img.shields.io/badge/license-MIT-188038.svg)](LICENSE)
 ![Status: Beta](https://img.shields.io/badge/status-Beta-red.svg)
@@ -32,11 +32,11 @@ This app acts as a pure API proxy. It is a thin MCP front-end: every tool target
 
 **Node.js 20 or newer**, with `node` and `npx` on your PATH. If you do not have it, take the LTS build from [nodejs.org](https://nodejs.org/en/download). Nothing else is needed: the MCP protocol (JSON-RPC 2.0 over stdio or Streamable HTTP) is hand-rolled on Node built-ins, so the package has zero dependencies.
 
-You also need at least one GPIO agent reachable on your LAN, a [`pi-gpio-api`](https://github.com/ctrlpi/pi-gpio-api) Pi or a [`pico-gpio-api`](https://github.com/ctrlpi/pico-gpio-api) Pico W. This bridge acts strictly as a control plane to drive them remotely.
+You also need at least one GPIO agent reachable on your LAN, a [`pi-gpio-api`](https://github.com/ctrlpi/pi-gpio-api) Pi, a [`pico-gpio-api`](https://github.com/ctrlpi/pico-gpio-api) Pico W, or an [`esp32-gpio-api`](https://github.com/ctrlpi/esp32-gpio-api) ESP32. This bridge acts strictly as a control plane to drive them remotely.
 
 ## Quick start, nothing to install
 
-Let Claude Desktop fetch and start the app itself. One step directly via `npx`. `npx` fetches the published package and runs it ephemerally.
+Let Claude Desktop fetch and start the app itself, in one step with `npx`, which downloads the published package and runs it without installing anything.
 
 Open Claude Desktop's **Settings → Developer → Edit Config**, which opens `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS or the equivalent file on Windows or Linux, and add the server under `mcpServers`:
 
@@ -53,7 +53,7 @@ Open Claude Desktop's **Settings → Developer → Edit Config**, which opens `~
 
 Restart Claude Desktop and the tools are there. Ask it what agents you have and it will call `mcp_agents_list`; from then on it can read pins, drive outputs, and configure the agents in plain conversation.
 
-The first launch sweeps your local /24 and writes every agent it finds to `~/.ctrlpi/config.json`. By default, newly discovered agents are recorded using their shipped default keys. (You can append `--rotate-keys` to the `args` array to automatically generate and apply a new random key to each one.)
+The first launch sweeps your local /24 and writes every agent it finds to `~/.ctrlpi/agents-config.json`. By default, newly discovered agents are recorded using their shipped default keys. (You can append `--rotate-keys` to the `args` array to automatically generate and apply a new random key to each one.)
 
 The sweep repeats on every launch and every hour after it, which is what picks up an agent switched on later and repairs the address of one that took a new DHCP lease (a Pico nearly always does on reset). Add `--no-scan` to turn that off once your setup has settled, and take it out again the day something moves.
 
@@ -64,7 +64,7 @@ Install it properly when you want to own the process, or when **the bridge runs 
 ```bash
 npm install @ctrlpi/mcp-bridge
 cd node_modules/@ctrlpi/mcp-bridge
-node server.js --http
+npm start -- --http
 ```
 
 It listens on port **8315** on every interface, so any client on the LAN reaches it at `http://<host>:8315/mcp`. Set `mcp.api_key` before you expose it: HTTP mode is key-gated, and the first caller to connect with a key of its own claims it (see [Authentication](#authentication)). `--local` keeps the listener on loopback instead.
@@ -84,7 +84,7 @@ pm2 save
 
 ## Run
 
-Run it with `node server.js` from the installation folder (`node_modules/@ctrlpi/mcp-bridge`), or `npx -y @ctrlpi/mcp-bridge` with no install at all. The arguments below are identical either way.
+Run it with `npm start` from the installation folder (`node_modules/@ctrlpi/mcp-bridge`), passing flags after `--` (`npm start -- --http`), or with `npx -y @ctrlpi/mcp-bridge` and no install at all. The flags below are identical either way, and one given without a valid value (say `--port` with no number) stops the server with an error.
 
 **stdio** is the default and communicates directly over standard input/output: the transport is the process's own stdin and stdout, and the client that launched it owns both. Everything the server would print goes to stderr instead, because stdout is the protocol channel. This is the mode Claude Desktop uses.
 
@@ -100,14 +100,15 @@ Run it with `node server.js` from the installation folder (`node_modules/@ctrlpi
 | `--host <ip>`        | Explicit bind address; wins over `--local`. |
 | `--port <n>`         | Listen port (default `8315`). |
 | `--rotate-keys`      | Replace the shipped default key on any agent still using it with a random one, and record the date under `key_set`. |
-| `--no-scan`          | Never sweep the LAN, at startup or after. A first run with no config still sweeps once, since there would be no agents at all otherwise. |
+| `--no-scan`          | Turn off the automatic LAN sweeps, at startup and hourly. A first run with no config still sweeps once, since there would be no agents at all otherwise. An explicit `mcp_agents_list(rescan=true)` still sweeps. |
+| `--rescan <n>`       | Minutes between the automatic sweeps (default `60`). `0` turns them off, like `--no-scan`. |
 | `--config <folder>`  | Keep both config files in this folder instead of `~/.ctrlpi/`. |
 
 ### Connect from Claude Desktop
 
 For the ordinary case, where Claude Desktop launches the server itself over stdio, use the `npx` form under [Quick start](#quick-start-nothing-to-install). Substitute `"command": "node", "args": ["<path>/node_modules/@ctrlpi/mcp-bridge/server.js"]` if you installed it instead.
 
-To reach a bridge over the network, start it in HTTP mode first (`node server.js --http`), then connect through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), passing `mcp.api_key` (`your-mcp-key` by default, see [Configuration](#configuration)):
+To reach a bridge over the network, start it in HTTP mode first (`npm start -- --http`), then connect through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), passing `mcp.api_key` (`your-mcp-key` by default, see [Configuration](#configuration)):
 
 ```json
 {
@@ -148,7 +149,7 @@ Two independent keys are in play, and they are never the same one:
 | Key | Where it lives | What it does |
 |---|---|---|
 | `mcp.api_key` | `~/.ctrlpi/mcp-config.json` | Gates **this server** in `--http` mode. Sent as an `Api-Key` header, the only form accepted. Starts as `your-mcp-key` and is claimed on first use, below. |
-| `agents[].api_key` | `~/.ctrlpi/config.json` | Each **agent's** own key, forwarded on every proxied REST call. Never sent to an MCP client. |
+| `agents[].api_key` | `~/.ctrlpi/agents-config.json` | Each **agent's** own key, forwarded on every proxied REST call. Never sent to an MCP client. |
 
 **stdio mode needs no key at all**: the transport is the process's own stdin/stdout, so whoever launched it already has that access.
 
@@ -160,28 +161,30 @@ This is trust on first use, so the window is exactly as safe as your network dur
 
 > **No TLS.** The HTTP transport speaks plain HTTP, so `mcp.api_key` travels as plaintext. That's fine on a trusted LAN, but don't expose port 8315 directly to the internet. If you need remote access, tunnel it. `--local` keeps the listener on loopback. The key is exclusively read from the `Api-Key` header, keeping it out of shell history and proxy logs.
 
+A request from a web browser is accepted only from a `localhost` or IP-address page (its `Origin` header), so a web page cannot reach the bridge through a domain pointed at your network (DNS rebinding). MCP clients that are not browsers send no `Origin` and are unaffected.
+
 ## Tools
 
-Every tool except `mcp_agents_list` takes an `agent` argument naming an entry from the shared `~/.ctrlpi/config.json`.
+Every tool except `mcp_agents_list` takes an `agent` argument naming an entry from the shared `~/.ctrlpi/agents-config.json`.
 
 | Tool | Description |
 |------|-------------|
-| `mcp_agents_list(rescan)` | List all configured agents with `name`, `ip`, `port`, `online` (live `/hello` probe), `type` (`pi` / `pico`), `version` (from `/config/read`), and `last_updated_at`. Unreachable agents are listed too, marked `online=false`. The LAN is scanned automatically every hour to find new agents. Pass `rescan=true` to actively force a network sweep right now (note: this takes a long time, so use it only when explicitly looking for new hardware). |
+| `mcp_agents_list(rescan)` | List all configured agents with `name`, `ip`, `port`, `online` (live `/hello` probe), `type` (`pi` / `pico` / `esp32`), `version` (from `/config/read`) and `has_default_key` (still on the shipped agent key), plus `last_updated_at`: when the agent list was last saved, UTC `YYYY-MM-DD HH:MM:SS`. Unreachable agents are listed too, marked `online=false`. The LAN is swept automatically every hour to find new agents. Pass `rescan=true` to sweep it right now (it takes 10 seconds or more, so use it only when looking for new hardware). |
 | `mcp_gpio_read(agent, name_or_gpio)` | Read a pin by number or name. Pass `"all"` to read every configured pin. |
 | `mcp_gpio_write(agent, name_or_gpio, value, duration)` | Write `"0"`, `"1"`, `"on"`, `"off"` or `"toggle"`. Optional `duration` (seconds) pulses the pin and reverts it; a pin's configured `max` clamps that, and supplies it when no duration is given. |
 | `mcp_gpio_config(agent, gpio, name, type, init, pullup, max, reversed, watched)` | Configure a pin. Same fields as the agent's REST config endpoint. |
 | `mcp_gpio_watched(agent)` | List the GPIO pins that are currently being actively watched (emitting hardware interrupts/webhooks). |
-| `mcp_gpio_scan(agent)` | Scan every hardware pin (BCM 2-27 on a Pi, GP0-GP28 on a Pico). |
-| `mcp_sensor_config(agent, name, script, remove)` | Configure a named sensor. `script` is `"<file> [args...]"`: a bare filename in the agent's `scripts/` folder, letters/digits-only args. A shell script on a Pi, a `.py` the agent execs in-process on a Pico. Pass `remove=true` to delete it. |
+| `mcp_gpio_scan(agent)` | Scan every hardware pin (BCM 2-27 on a Pi, GP0-GP28 on a Pico, every usable pin of the chip on an ESP32). |
+| `mcp_sensor_config(agent, name, script, remove)` | Configure a named sensor. `script` is `"<file> [args...]"`: a bare filename in the agent's `scripts/` folder, letters/digits-only args. A shell script on a Pi, a `.py` the agent execs in-process on a Pico or ESP32. Pass `remove=true` to delete it. |
 | `mcp_sensor_read(agent, name)` | Read one sensor by name, or every configured sensor merged into one object when `name` is omitted. |
 | `mcp_config_read(agent)` | Read the agent's full config: `notifications`, `bridges`, `settings`, `sensors`, `gpios`, plus the live `agent` block. |
-| `mcp_config_write(agent, name, api_key, webhook_url, webhook_key, docs_enabled, logs_enabled, log_days)` | Update config fields, named ungrouped (the agent routes each into its group). Changing the agent's `api_key` takes effect immediately, and the bridge automatically updates its entry in the shared `config.json` to match. |
+| `mcp_config_write(agent, name, api_key, webhook_url, webhook_key, docs_enabled, logs_enabled, log_days)` | Update config fields, named ungrouped (the agent routes each into its group). Changing the agent's `api_key` takes effect immediately, and the bridge automatically updates its entry in the shared `agents-config.json` to match. |
 | `mcp_config_load(agent, config)` | Load a whole config onto the agent. Pass `{}` to reset it, keeping only its API key. |
-| `mcp_agent_restart(agent, reboot)` | Restart the agent's process. `reboot=true` reboots the physical device (honored on a real Pi only). |
-| `mcp_agent_upgrade(agent)` | Upgrade the agent in place: downloads the latest release and reinstalls dependencies, then restarts. |
+| `mcp_agent_restart(agent, reboot)` | Restart the agent's process. `reboot=true` reboots the whole device instead (a Pi, Pico or ESP32; an agent running on a Mac restarts the process). |
+| `mcp_agent_upgrade(agent)` | Upgrade the agent to the latest release, then restart it. A Pi re-downloads the release and reinstalls dependencies; a Pico or ESP32 downloads the new files over WiFi and resets. |
 | `mcp_agent_logs(agent)` | Read the last 50 lines of the agent's log. |
 
-Tools return the agent's JSON response as text, or an `Error: ...` string when the agent is unknown, unreachable, or answers with an error status.
+Tools return the agent's JSON response as text, or an `Error: ...` string flagged with `isError` when the agent is unknown, unreachable, or answers with an error status.
 
 ## Configuration
 
@@ -189,18 +192,20 @@ Tools return the agent's JSON response as text, or an `Error: ...` string when t
 
 Two files. Neither ships with the package: the first run builds both from a LAN scan, so there is no template to copy.
 
-**`~/.ctrlpi/config.json`** - the agents, shared with every other ctrlPi project:
+**`~/.ctrlpi/agents-config.json`** - the agents, shared with every other ctrlPi project:
 
 ```json
 {
     "agents": [
         { "name": "garage-pi", "ip": "192.168.1.50", "port": 8314,
-          "api_key": "a1b2c3d4e5f60718293a4b5c", "key_set": "2026-08-20 14:23:13" },
+          "api_key": "a1b2c3d4e5f60718293a4b5c", "key_set": "2026-08-20 14:23:13", "updated_at": "2026-08-20 14:23:13" },
         { "name": "shed-pico", "ip": "192.168.1.51", "port": 8314,
-          "api_key": "shed-pico-secret-key" }
+          "api_key": "shed-pico-secret-key", "updated_at": "2026-08-20 14:25:00" }
     ]
 }
 ```
+
+When reading shared agents, `mcp-bridge` also checks if `/var/lib/homebridge/ctrlpi-agents-config.json` exists; if so, it reads it (read-only) and reconciles agents whose `updated_at` date/time is newer. It never writes to the Homebridge config file.
 
 **`~/.ctrlpi/mcp-config.json`** - what only this server owns:
 
@@ -216,17 +221,18 @@ Two files. Neither ships with the package: the first run builds both from a LAN 
 | `mcp.api_key` | `mcp-config.json` | Secret required to reach this server **in HTTP mode**. Ignored in stdio mode. Starts as `your-mcp-key` and is claimed on first use (see [Claiming the HTTP key](#claiming-the-http-key)). |
 | `mcp.key_set` | `mcp-config.json` | When `mcp.api_key` was claimed, UTC `YYYY-MM-DD HH:MM:SS`. Absent if the key was set by hand. |
 | `agents.whitelist` / `agents.blacklist` | `mcp-config.json` | Optional. Agent **names** this server may drive: a whitelist keeps only those, a blacklist drops those, both means whitelist minus blacklist, neither means all of them. Tools exclusively see agents permitted by the filter, ensuring only approved agents can be addressed. |
-| `agents[].name` | `config.json` | Unique name used to target the agent in every tool call. |
-| `agents[].ip` | `config.json` | LAN IP or hostname of the agent's REST server. |
-| `agents[].port` | `config.json` | REST port (optional, default `8314`). |
-| `agents[].api_key` | `config.json` | That agent's own `Api-Key`, forwarded on every proxied request. |
-| `agents[].key_set` | `config.json` | When `api_key` was last set by `--rotate-keys`, UTC `YYYY-MM-DD HH:MM:SS`. Absent on an agent whose key this app never set. Anything that changes an agent's key should update it. |
+| `agents[].name` | `agents-config.json` | Unique name used to target the agent in every tool call. |
+| `agents[].ip` | `agents-config.json` | LAN IP or hostname of the agent's REST server. |
+| `agents[].port` | `agents-config.json` | REST port (optional, default `8314`). |
+| `agents[].api_key` | `agents-config.json` | That agent's own `Api-Key`, forwarded on every proxied request. |
+| `agents[].key_set` | `agents-config.json` | When `api_key` was last set by `--rotate-keys`, UTC `YYYY-MM-DD HH:MM:SS`. Absent on an agent whose key this app never set. Anything that changes an agent's key should update it. |
+| `agents[].updated_at` | `agents-config.json` | Date and time the agent record was created or updated, UTC `YYYY-MM-DD HH:MM:SS`. |
 
 Both files are re-read on every tool call, so adding, removing or re-keying an agent by hand takes effect without a restart. The filter is applied only to what tools see: discovery always saves the full shared list, so narrowing it here strictly preserves other projects' agents in the shared list.
 
 ## Agent discovery
 
-The agent list keeps itself current. **Every start sweeps the local /24, and so does every hour after that**, so an agent switched on later is picked up without anyone restarting anything. `--no-scan` turns all of it off.
+The agent list keeps itself current. **Every start sweeps the local /24, and so does every hour after that**, so an agent switched on later is picked up without anyone restarting anything. The sweep runs in the background, so the server answers at once; a tool that names an agent the sweep has not filed yet waits for it. `--no-scan` turns the automatic sweeps off.
 
 Each sweep is one scan feeding three passes, in this order:
 
@@ -260,9 +266,14 @@ mcp-bridge is an inbound control plane only; it never receives the agents' webho
 
 - **[`pi-gpio-api`](https://github.com/ctrlpi/pi-gpio-api)**: Raspberry Pi GPIO REST server that reads inputs and drives outputs (and named sensors) over an HTTP API.
 - **[`pico-gpio-api`](https://github.com/ctrlpi/pico-gpio-api)**: Raspberry Pi Pico W port of the GPIO REST server, with the same endpoints, wire format, and auth.
-- **`homekit-bridge`** *(coming soon)*: native Apple HomeKit bridge that exposes GPIO pins and sensors as HomeKit accessories, driven over the agents' REST API.
+- **[`esp32-gpio-api`](https://github.com/ctrlpi/esp32-gpio-api)**: ESP32 port of the GPIO REST server for MicroPython, with the same endpoints, wire format, and auth.
+- **[`homebridge-ctrlpi`](https://github.com/ctrlpi/homebridge-ctrlpi)**: A Homebridge plugin that brings Raspberry Pi, Pico W, and ESP32 GPIO into Apple Home, by driving one or more GPIO agents over their REST API.
+- **`homekit-bridge`** *(coming soon)*: Native Apple HomeKit bridge that exposes GPIO pins and sensors as HomeKit accessories, driven over the agents' REST API.
 - **`matter-bridge`** *(coming soon)*: Matter bridge that exposes GPIO pins and sensors to any Matter platform (Apple Home, Google Home, Alexa, Home Assistant), driven over the agents' REST API.
-- **`ctrlpi-lab`** *(coming soon)*: Web dashboard for monitoring and controlling agents over REST API and MCP.
+- **[`ctrlpi-cli`](https://github.com/ctrlpi/ctrlpi-cli)**: Command-line interface for interacting with ctrlPi agents, with shared agent configuration.
+- **[`ctrlpi-lab`](https://github.com/ctrlpi/ctrlpi-lab)**: A local browser dashboard for your ctrlPi setup. Test GPIO and sensor endpoints, watch webhook events, and tail agent logs.
+- **[`pico-bay`](https://github.com/ctrlpi/pico-bay)**: Web app and MCP server for managing MicroPython and CircuitPython boards, such as the Raspberry Pi Pico and ESP32, over USB.
+- **`pi-bay`** *(coming soon)*: A local web app and MCP server for Raspberry Pi boards over the network. Edit files, open a remote terminal, and manage your Pi remotely.
 
 ## Testing
 
@@ -274,4 +285,4 @@ npm test
 
 ## License
 
-[MIT](http://localhost:8181/LICENSE)
+[MIT](LICENSE)

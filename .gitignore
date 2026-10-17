@@ -32,3 +32,4 @@ __pycache__/
 
 # Project-specific
 config.json
+agents-config.json

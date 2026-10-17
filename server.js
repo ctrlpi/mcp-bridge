@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// mcp-bridge - an MCP server that controls one or more GPIO agents (Raspberry Pi
-// or Pico W) by calling their REST API over HTTP.
+// mcp-bridge - an MCP server that controls one or more GPIO agents (Raspberry Pi,
+// Pico W or ESP32) by calling their REST API over HTTP.
 //
 // This app acts as an API proxy. It routes tool calls to remote agents by name (from
-// config.json) using their `pi-gpio-api` / `pico-gpio-api`
+// agents-config.json) using their `pi-gpio-api` / `pico-gpio-api` / `esp32-gpio-api`
 // REST endpoints, forwarding the agent's own `Api-Key`. Run it over stdio (for local
 // MCP clients like Claude Desktop) or over Streamable HTTP (for networked clients).
 
@@ -14,66 +14,121 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const http = require("http");
+const dgram = require("dgram");
+const net = require("net");
 const readline = require("readline");
 const { randomUUID, timingSafeEqual } = require("crypto");
+
+// The value after a flag such as --port, or null when the flag is absent. A flag given
+// without a value is a usage error, so the server exits instead of guessing.
+function flagValue(flag) {
+  const args = process.argv.slice(2);
+  const i = args.indexOf(flag);
+  if (i < 0) return null;
+  const v = args[i + 1];
+  if (v === undefined || v.startsWith("--")) usageError(`${flag} needs a value`);
+  return v;
+}
+
+// A flag value that must be a whole number in [min, max].
+function intFlag(flag, fallback, min, max) {
+  const v = flagValue(flag);
+  if (v === null) return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < min || n > max) usageError(`${flag} must be a whole number from ${min} to ${max}, not '${v}'`);
+  return n;
+}
+
+function usageError(msg) {
+  console.error(`mcp-bridge: ${msg}`);
+  process.exit(2);
+}
 
 // --- Where the config files live ---------------------------------------------------
 // Everything lives in ~/.ctrlpi/ (or the folder specified by --config).
 // Two files, both flat in that one directory:
 //
-//   config.json      the SHARED agent list (name/ip/port/api_key/key_set) - every ctrlpi
-//                    project reads it and any of them may update it
-//   mcp-config.json  only what this server owns: `mcp` (its own HTTP-mode key, plus the
-//                    ip/port gpio-lab records for it) and an optional agents
-//                    whitelist/blacklist (see selectAgents below)
+//   agents-config.json  the SHARED agent list (name/ip/port/api_key/key_set/updated_at) -
+//                       every ctrlpi project reads it and any of them may update it
+//   mcp-config.json     only what this server owns: `mcp` (its own HTTP-mode key, plus the
+//                       ip/port ctrlpi-lab records for it) and an optional agents
+//                       whitelist/blacklist (see selectAgents below)
 //
 // Both files always sit together in the same directory.
 function resolveConfigFile(fileName) {
-    const args = process.argv.slice(2);
-    const i = args.indexOf("--config");
-    let dir = path.join(os.homedir(), ".ctrlpi");
-    if (i >= 0 && args[i + 1] && !args[i + 1].startsWith("--")) {
-        dir = path.resolve(args[i + 1]);
-    }
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {
-        console.error(`Could not create ${dir}: ${e.message}`);
-    }
-    return path.join(dir, fileName);
+  let dir = path.join(os.homedir(), ".ctrlpi");
+  const custom = flagValue("--config");
+  if (custom !== null) dir = path.resolve(custom);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {
+    console.error(`Could not create ${dir}: ${e.message}`);
+  }
+  return path.join(dir, fileName);
 }
 
 const CONFIG_FILE = resolveConfigFile("mcp-config.json");
-const SHARED_FILE = path.join(path.dirname(CONFIG_FILE), "config.json");
-const STATE_DIR = path.dirname(CONFIG_FILE);
+const SHARED_FILE = path.join(path.dirname(CONFIG_FILE), "agents-config.json");
+const HOMEBRIDGE_SHARED_FILE = "/var/lib/homebridge/ctrlpi-agents-config.json";
 const DEFAULT_PORT = 8314; // default REST port for agents that don't specify one
-const DEFAULT_AGENT_KEY = "your-secret-key"; // pi-gpio-api / pico-gpio-api's default Api-Key
+const DEFAULT_AGENT_KEY = "your-secret-key"; // the agents' shipped default Api-Key
 const DEFAULT_HTTP_KEY = "your-mcp-key"; // this server's own default key, gating --http mode
-const MAX_BODY_BYTES = 64 * 1024; // largest accepted --http request body, else 413. The biggest
-                                  // real one is mcp_config_load carrying a full agent config: a
-                                  // fully-populated Pi (26 pins + sensors) measures under 5 KB,
-                                  // so this is an abuse guard, not a limit anything legitimate meets
+const MAX_BODY_BYTES = 64 * 1024; // largest --http request body, else 413 (a full Pi config is under 5 KB)
 const HTTP_TIMEOUT = 20000; // per-call timeout when proxying to an agent (ms)
 const PROBE_TIMEOUT = 3000; // shorter timeout for liveness/type probes in agents_list (ms)
-const CONFIG_MAX_AGE = 3600; // seconds; mcp_agents_list re-scans the LAN when config.json is older
-const SWEEP_INTERVAL = CONFIG_MAX_AGE; // seconds between the background sweeps that keep the agent
-                                       // list current while the server runs. Same period as the
-                                       // staleness rule above, so the two never disagree about
-                                       // when the list is old
+const SWEEP_MINUTES = 60;   // default minutes between background LAN sweeps (--rescan <n>)
 const SCAN_TIMEOUT = 1500; // /hello timeout during a /24 sweep - a Zero 2 W or a Pico often
                            // misses a shorter window, and an agent the scan misses is one
                            // this server never sees
 const SCAN_BATCH = 48;     // hosts probed at once; a Pico serves one connection at a time and
                            // drops probes when the whole /24 is fired simultaneously
 
-// --- First-run setup: scan the LAN for agents and build config.json ---
+// --- Discovery: sweep the LAN for agents and keep agents-config.json current ---
 
 function localIp() {
-  const ifaces = os.networkInterfaces();
-  for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) return iface.address;
+  return new Promise((resolve) => {
+    const fallback = () => {
+      try {
+        const ifaces = os.networkInterfaces();
+        for (const name of Object.keys(ifaces)) {
+          for (const iface of ifaces[name] || []) {
+            if ((iface.family === "IPv4" || iface.family === 4) && !iface.internal && iface.address && !iface.address.startsWith("127.")) {
+              return resolve(iface.address);
+            }
+          }
+        }
+      } catch { /* ignore */ }
+      resolve(null);
+    };
+
+    const s = dgram.createSocket("udp4");
+    const timer = setTimeout(() => {
+      try { s.close(); } catch { /* ignore */ }
+      fallback();
+    }, 500);
+
+    s.once("error", () => {
+      clearTimeout(timer);
+      try { s.close(); } catch { /* ignore */ }
+      fallback();
+    });
+
+    try {
+      s.connect(80, "8.8.8.8", () => {
+        clearTimeout(timer);
+        try {
+          const ip = s.address().address;
+          s.close();
+          if (ip && ip !== "0.0.0.0" && !ip.startsWith("127.")) return resolve(ip);
+        } catch {
+          try { s.close(); } catch { /* ignore */ }
+        }
+        fallback();
+      });
+    } catch {
+      clearTimeout(timer);
+      try { s.close(); } catch { /* ignore */ }
+      fallback();
     }
-  }
-  return null;
+  });
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT) {
@@ -87,7 +142,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT) {
 }
 
 async function probeHello(ip, port = DEFAULT_PORT, timeoutMs = SCAN_TIMEOUT) {
-  // One unauthenticated /hello. Returns {ip, name} or null. /hello needs no key, so this
+  // One unauthenticated /hello. Returns {ip, port, name} or null. /hello needs no key, so this
   // is safe to point at any address - nothing of ours is disclosed by asking.
   try {
     const r = await fetchWithTimeout(`http://${ip}:${port}/hello`, {}, timeoutMs);
@@ -102,11 +157,12 @@ async function probeHello(ip, port = DEFAULT_PORT, timeoutMs = SCAN_TIMEOUT) {
 }
 
 async function scanForAgents(port = DEFAULT_PORT, timeoutMs = SCAN_TIMEOUT) {
-  // Probe every host on the local /24 for an unauthenticated /hello, like
-  // ctrlpi-api-tester/ctrlpi-cli.py's discovery. Returns [{ip, name, port}, ...].
-  const ip = localIp();
+  // Probe every host on the local /24 for an unauthenticated /hello.
+  // Returns [{ip, name, port}, ...].
+  // MCP_BRIDGE_SCAN_LAN=0 limits the sweep to the localhost mock agents (used by the tests).
+  const ip = process.env.MCP_BRIDGE_SCAN_LAN === "0" ? null : await localIp();
   const results = [];
-  
+
   if (ip) {
     const prefix = ip.split(".").slice(0, 3).join(".");
     note(`Scanning ${prefix}.0/24 on port ${port} for agents...`);
@@ -147,8 +203,8 @@ function randomKey() {
 }
 
 // UTC "YYYY-MM-DD HH:MM:SS", the same shape the agents use for their own `config_updated`.
-function nowStamp() {
-  return new Date().toISOString().slice(0, 19).replace("T", " ");
+function nowStamp(date = new Date()) {
+  return date.toISOString().slice(0, 19).replace("T", " ");
 }
 
 async function agentAcceptsKey(ip, port, key) {
@@ -180,7 +236,7 @@ async function resolveAgentKey(ip, port, rotateKeys) {
   if (await agentAcceptsKey(ip, port, DEFAULT_AGENT_KEY)) {
     // Still on the key it shipped with, which every ctrlpi user knows. --rotate-keys replaces
     // it with a random one; without the flag nothing is touched, since rotating is close to
-    // irreversible (the new key exists only in config.json) and must always be asked for.
+    // irreversible (the new key exists only in agents-config.json) and must always be asked for.
     if (!rotateKeys) {
       note(`    on the default key, left unchanged (pass --rotate-keys to secure it)`);
       return { api_key: DEFAULT_AGENT_KEY };
@@ -195,7 +251,7 @@ async function resolveAgentKey(ip, port, rotateKeys) {
       return { api_key: DEFAULT_AGENT_KEY };
     }
   }
-  note(`    already has its own key, which this app cannot read - set api_key in config.json`);
+  note(`    already has its own key, which this app cannot read - set api_key in agents-config.json`);
   return { api_key: "" };
 }
 
@@ -213,6 +269,7 @@ async function rotateConfiguredKeys(config) {
       await setAgentKey(a.ip, port, DEFAULT_AGENT_KEY, newKey);
       a.api_key = newKey;
       a.key_set = nowStamp();
+      a.updated_at = nowStamp();
       changed = true;
       note(`  ${a.name} (${a.ip}): key rotated`);
     } catch (e) {
@@ -240,11 +297,11 @@ async function searchAndAddAgents(rotateKeys, found = null) {
   const toAdd = fresh.filter(({ name }) => !knownNames.has(name));
   for (const { ip, port, name } of sameName) {
     note(`  '${name}' (${ip}:${port || DEFAULT_PORT}) is already configured under that name - not adding it. ` +
-         `Its address could not be reconciled; check config.json.`);
+         `Its address could not be reconciled; check agents-config.json.`);
   }
   if (!toAdd.length) {
     if (!sameName.length) {
-      note(agents.length ? "No new agents found." : "No agents found. You can add them later by editing config.json.");
+      note(agents.length ? "No new agents found." : "No agents found. You can add them later by editing agents-config.json.");
     }
   } else {
     note(`Found ${toAdd.length} new agent(s):`);
@@ -252,7 +309,7 @@ async function searchAndAddAgents(rotateKeys, found = null) {
       knownNames.add(name);
       note(`  ${name} (${ip}:${port || DEFAULT_PORT})`);
       const key = await resolveAgentKey(ip, port || DEFAULT_PORT, rotateKeys);
-      agents.push({ name, ip, port: port || DEFAULT_PORT, ...key });
+      agents.push({ name, ip, port: port || DEFAULT_PORT, ...key, updated_at: nowStamp() });
     }
   }
   // Merge updates into the shared file: the `agents` key is written while preserving
@@ -275,10 +332,10 @@ async function renameAgent(ip, port, key, newName) {
 }
 
 async function reconcileAgents(config, { rotate = false, found = null } = {}) {
-  // Runs on every start that has agents configured: agents take new DHCP leases (a Pico
-  // nearly always does on reset), so an IP in config.json goes stale without anything
+  // Runs on every sweep that has agents configured: agents take new DHCP leases (a Pico
+  // nearly always does on reset), so an IP in agents-config.json goes stale without anything
   // being wrong. Sweeps the LAN and repairs entries whose agent simply moved. Adds
-  // nothing - the add pass in sweep() does that. Returns true if config.json was rewritten.
+  // nothing - the add pass in sweep() does that. Returns true if agents-config.json was rewritten.
   const agents = config.agents || [];
   if (!agents.length) return false;
 
@@ -293,7 +350,8 @@ async function reconcileAgents(config, { rotate = false, found = null } = {}) {
     // device gets adopted.
     const claimants = found.filter((f) => f.name === a.name);
     if (!claimants.length) continue;                                  // offline, or renamed
-    if (claimants.length === 1 && claimants[0].ip === a.ip) continue;  // where we left it
+    if (claimants.length === 1 && claimants[0].ip === a.ip &&
+        (claimants[0].port || DEFAULT_PORT) === port) continue;          // where we left it
 
     // Is the configured agent still answering at its stored address, under its own name?
     const atOld = await probeHello(a.ip, port);
@@ -306,7 +364,7 @@ async function reconcileAgents(config, { rotate = false, found = null } = {}) {
         // No way to tell which one is the agent we know: the address we trusted is gone
         // and every claimant is equally (un)convincing. Touch nothing.
         console.error(`  ${a.name} does not answer at its configured ${a.ip} either - ` +
-                      `leaving it alone; fix config.json by hand.`);
+                      `leaving it alone; fix agents-config.json by hand.`);
         continue;
       }
       // The configured address answered, so that one is genuine and the rest are impostors.
@@ -370,11 +428,12 @@ async function reconcileAgents(config, { rotate = false, found = null } = {}) {
     // The stamp describes the key it sits beside, so a key we did not set has no date:
     // the agent was reflashed or hand-edited, and the old date would now be a lie.
     if (reset) delete a.key_set;
+    a.updated_at = nowStamp();
     changed = true;
   }
 
   // After all moves are settled, if any agent is currently active on an endpoint,
-  // ensure no OTHER agent in config.json is still claiming that endpoint.
+  // ensure no OTHER agent in agents-config.json is still claiming that endpoint.
   // This clears stale IPs from agents that went offline and whose lease was taken by someone else.
   for (const c of found) {
     const cEndpoint = `${c.ip}:${c.port || DEFAULT_PORT}`;
@@ -382,6 +441,7 @@ async function reconcileAgents(config, { rotate = false, found = null } = {}) {
       if (a.ip && `${a.ip}:${a.port || DEFAULT_PORT}` === cEndpoint && a.name !== c.name) {
         note(`Clearing stale IP ${a.ip} from '${a.name}' (now occupied by live agent '${c.name}').`);
         a.ip = "";
+        a.updated_at = nowStamp();
         changed = true;
       }
     }
@@ -393,41 +453,6 @@ async function reconcileAgents(config, { rotate = false, found = null } = {}) {
     note(`Updated ${SHARED_FILE}.`);
   }
   return changed;
-}
-
-async function rescanAgents() {
-  // Re-scan the LAN and merge any newly discovered agents into the shared config.json,
-  // preserving existing entries (and their hand-edited keys/names). Non-interactive - new
-  // agents get the default Api-Key. Always rewrites that file, which refreshes its mtime so
-  // the next auto-rescan is at least CONFIG_MAX_AGE away. Returns the runtime (filtered)
-  // config, since that is what the caller hands back to a tool.
-  const config = loadSetupConfig();
-  const agents = config.agents || [];
-  const knownIps = new Set(agents.map((a) => a.ip));
-  const usedNames = new Set(agents.map((a) => a.name));
-  for (const { ip, name: rawName } of await scanForAgents()) {
-    if (knownIps.has(ip)) continue;
-    let name = rawName;
-    if (usedNames.has(name)) name = `${name}-${ip.split(".").pop()}`;
-    usedNames.add(name);
-    knownIps.add(ip);
-    agents.push({ name, ip, port: DEFAULT_PORT, api_key: DEFAULT_AGENT_KEY });
-  }
-  config.agents = agents;
-  saveConfig(config);
-  return loadConfig();
-}
-
-function configIsStale() {
-  // True when the shared config.json is missing or older than CONFIG_MAX_AGE - the trigger
-  // for an automatic LAN re-scan in mcp_agents_list. It is the agent list that goes stale,
-  // so it is that file's mtime that matters, not this server's own settings file.
-  try {
-    const ageSec = (Date.now() - fs.statSync(SHARED_FILE).mtimeMs) / 1000;
-    return ageSec > CONFIG_MAX_AGE;
-  } catch {
-    return true;
-  }
 }
 
 // --- Config / agent lookup ---
@@ -443,13 +468,40 @@ function readJsonFile(file) {
   }
 }
 
+function reconcileAgentList(baseAgents, overlayAgents) {
+  const list = Array.isArray(baseAgents) ? [...baseAgents] : [];
+  if (!Array.isArray(overlayAgents)) return list;
+  for (const overlay of overlayAgents) {
+    if (!overlay || !overlay.name) continue;
+    const idx = list.findIndex((a) => a && a.name === overlay.name);
+    if (idx === -1) {
+      list.push({ ...overlay });
+    } else {
+      const existing = list[idx];
+      const overlayDate = overlay.updated_at || "";
+      const existingDate = existing.updated_at || "";
+      if (overlayDate > existingDate) {
+        list[idx] = { ...existing, ...overlay };
+      }
+    }
+  }
+  return list;
+}
+
 const loadOwn = () => readJsonFile(CONFIG_FILE);
 const loadSharedAgents = () => {
   const shared = readJsonFile(SHARED_FILE);
-  return Array.isArray(shared.agents) ? shared.agents : [];
+  let list = Array.isArray(shared.agents) ? shared.agents : [];
+  if (fs.existsSync(HOMEBRIDGE_SHARED_FILE)) {
+    const hb = readJsonFile(HOMEBRIDGE_SHARED_FILE);
+    if (Array.isArray(hb.agents)) {
+      list = reconcileAgentList(list, hb.agents);
+    }
+  }
+  return list;
 };
 
-// The shared config.json is the only place agents are defined. This server's own file may
+// The shared agents-config.json is the only place agents are defined. This server's own file may
 // narrow that list with `agents: { whitelist, blacklist }` - agent names, matched exactly:
 // a whitelist alone keeps only those, a blacklist alone drops those, both means whitelist
 // minus blacklist, and neither (or an empty object) means every agent in the shared file.
@@ -498,7 +550,8 @@ function saveConfig(config) {
   }
   config.agents = list;
 
-  const shared = readJsonFile(SHARED_FILE);
+  let shared = readJsonFile(SHARED_FILE);
+  if (!shared || typeof shared !== "object" || Array.isArray(shared)) shared = {};
   shared.agents = list;
   fs.writeFileSync(SHARED_FILE, JSON.stringify(shared, null, 4));
   const own = loadOwn();
@@ -523,9 +576,36 @@ function ensureHttpKey(own) {
   return own;
 }
 
+// Agent names match case-insensitively everywhere a tool names an agent.
+function sameName(a, b) {
+  return String(a || "").toLowerCase() === String(b || "").toLowerCase();
+}
+
 function findAgent(name) {
-  const lower = String(name).toLowerCase();
-  return agents().find((a) => String(a.name || "").toLowerCase() === lower) || null;
+  return agents().find((a) => sameName(a.name, name)) || null;
+}
+
+// Copy a name or key the agent just accepted into the shared file, so the next call still
+// reaches it. Waits for a running sweep first, so the sweep cannot save over this change.
+async function syncAgentEntry(agentName, { name, api_key } = {}) {
+  await settleSweep();
+  const config = loadSetupConfig();
+  const a = (config.agents || []).find((x) => sameName(x.name, agentName));
+  if (!a) return;
+  let updated = false;
+  if (typeof name === "string" && name && name !== a.name) {
+    a.name = name;
+    updated = true;
+  }
+  if (typeof api_key === "string" && api_key !== a.api_key) {
+    a.api_key = api_key;
+    a.key_set = nowStamp();
+    updated = true;
+  }
+  if (updated || !a.updated_at) {
+    a.updated_at = nowStamp();
+    saveConfig(config);
+  }
 }
 
 function baseUrl(agent) {
@@ -535,7 +615,12 @@ function baseUrl(agent) {
 async function callAgent(agentName, method, path_, jsonBody = undefined, timeoutMs = HTTP_TIMEOUT) {
   // Proxy an HTTP call to the named agent. Returns [textResult, errorString];
   // exactly one is non-null.
-  const agent = findAgent(agentName);
+  let agent = findAgent(agentName);
+  if (!agent && sweepPromise) {
+    // The background sweep may be about to file it (always the case on a first run).
+    await settleSweep();
+    agent = findAgent(agentName);
+  }
   if (!agent) {
     return [null, `Error: unknown agent '${agentName}'. Use mcp_agents_list to see configured agents.`];
   }
@@ -564,6 +649,34 @@ async function callAgent(agentName, method, path_, jsonBody = undefined, timeout
   return [body, null];
 }
 
+// Keys, names, URLs and scripts are text: a number an MCP client sends for one goes to the
+// agent as text (4242 -> "4242").
+function asText(v) {
+  return typeof v === "number" ? String(v) : v;
+}
+
+// asText() on every text field of a whole agent config (for mcp_config_load).
+function textFields(cfg) {
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return cfg;
+  const out = { ...cfg };
+  for (const k of ["name", "api_key", "webhook_url", "webhook_key", "matter", "matter_key",
+                   "homekit", "homekit_key", "homebridge", "homebridge_key"]) {
+    if (k in out) out[k] = asText(out[k]);
+  }
+  for (const group of ["notifications", "bridges"]) {
+    if (out[group] && typeof out[group] === "object") {
+      out[group] = Object.fromEntries(Object.entries(out[group]).map(([f, v]) => [f, asText(v)]));
+    }
+  }
+  for (const [section, field] of [["gpios", "name"], ["sensors", "script"]]) {
+    if (out[section] && typeof out[section] === "object") {
+      out[section] = Object.fromEntries(Object.entries(out[section]).map(([k, e]) =>
+        [k, e && typeof e === "object" && field in e ? { ...e, [field]: asText(e[field]) } : e]));
+    }
+  }
+  return out;
+}
+
 function coerceValue(v) {
   // Map a string write value onto what the REST API expects (int, or one of the
   // word forms 'on'/'off'/'toggle').
@@ -573,7 +686,49 @@ function coerceValue(v) {
   return v;
 }
 
+// Live status of one configured agent for mcp_agents_list: /hello, then /config/read for
+// the version and type.
+async function probeAgent(a) {
+  const { name, ip, port = DEFAULT_PORT } = a;
+  const entry = { name, ip, port, online: false, type: "unknown", version: null, has_default_key: a.api_key === DEFAULT_AGENT_KEY };
+  if (ip) {
+    const base = `http://${ip}:${port}`;
+    try {
+      entry.online = (await fetchWithTimeout(`${base}/hello`, {}, PROBE_TIMEOUT)).status === 200;
+    } catch {
+      // stays offline
+    }
+    if (entry.online) {
+      try {
+        const cr = await fetchWithTimeout(`${base}/config/read`, {
+          headers: { "Api-Key": a.api_key || "" },
+        }, PROBE_TIMEOUT);
+        if (cr.status === 200) {
+          const info = await cr.json();
+          const ai = info.agent || {};
+          entry.version = ai.version ?? null;
+          const plat = String(ai.platform || "").toLowerCase();
+          // "pico" is tested first because it also begins with "pi".
+          if (plat.includes("pico")) entry.type = "pico";
+          else if (plat.includes("esp32")) entry.type = "esp32";
+          else if (plat.split(/\s+/)[0] === "pi" || plat.includes("raspberry pi")) entry.type = "pi";
+          else if (plat) entry.type = plat;
+        }
+      } catch {
+        // leave version/type at defaults
+      }
+    }
+  }
+  return entry;
+}
+
 // --- MCP tools ---
+
+// A tool's MCP result: the agent's answer, or the error text flagged with isError.
+function toolResult(result, err) {
+  return err ? { content: [{ type: "text", text: err }], isError: true }
+             : { content: [{ type: "text", text: result }] };
+}
 
 // Each tool is { name, description, inputSchema, handler }. `inputSchema` is a plain
 // JSON Schema object (draft-07 style). `handler(args)` receives the call's `arguments`
@@ -582,56 +737,33 @@ const TOOLS = [
   {
     name: "mcp_agents_list",
     description:
-      "List configured agents (Pi or Pico). Returns name, ip, port, online (live /hello probe), " +
-      "type (pi/pico), version, has_default_key, and last_updated_at. Unreachable agents are included (online=false). " +
-      "The LAN is scanned automatically every hour (last_updated_at indicates the last scan time). " +
-      "You can pass rescan=true to forcefully sweep the LAN for new agents right now, but avoid doing " +
-      "this unless the user explicitly asks to find new hardware, as active scanning takes a long time. " +
-      "If has_default_key is true for any agent, explicitly tell the user they are using " +
-      "an insecure default key and ask if they want you to change it.",
+      "List configured agents (Pi, Pico or ESP32). Returns name, ip, port, online (live /hello probe), " +
+      "type (pi/pico/esp32), version, has_default_key, and last_updated_at (UTC \"YYYY-MM-DD HH:MM:SS\", " +
+      "when the agent list was last saved; every sweep saves it). Unreachable agents are included " +
+      "(online=false). The LAN is swept automatically every hour. Pass rescan=true to sweep it now, " +
+      "but only when the user asks to find new hardware: a sweep takes 10 seconds or more. " +
+      "If has_default_key is true for any agent, tell the user that agent is on the insecure " +
+      "default key and ask whether to change it.",
     inputSchema: {
       type: "object",
       properties: { rescan: { type: "boolean" } },
     },
     handler: async ({ rescan }) => {
-      if (rescan || configIsStale()) await rescanAgents();
-      const out = [];
-      for (const a of agents()) {
-        const { name, ip, port = DEFAULT_PORT } = a;
-        const entry = { name, ip, port, online: false, type: "unknown", version: null, has_default_key: a.api_key === DEFAULT_AGENT_KEY };
-        if (ip) {
-          const base = `http://${ip}:${port}`;
-          try {
-            entry.online = (await fetchWithTimeout(`${base}/hello`, {}, PROBE_TIMEOUT)).status === 200;
-          } catch {
-            // stays offline
-          }
-          if (entry.online) {
-            try {
-              const cr = await fetchWithTimeout(`${base}/config/read`, {
-                headers: { "Api-Key": a.api_key || "" },
-              }, PROBE_TIMEOUT);
-              if (cr.status === 200) {
-                const info = await cr.json();
-                // Machine facts moved under `agent` in /config/read (0.9.9+)
-                const ai = info.agent || {};
-                entry.version = ai.version ?? null;
-                const plat = String(ai.platform || "").toLowerCase();
-                // "pico" is tested first because it also begins with "pi".
-                if (plat.includes("pico")) entry.type = "pico";
-                else if (plat.split(/\s+/)[0] === "pi" || plat.includes("raspberry pi")) entry.type = "pi";
-                else if (plat) entry.type = plat;
-              }
-            } catch {
-              // leave version/type at defaults
-            }
-          }
+      // An explicit rescan runs even under --no-scan; otherwise wait out a sweep in progress.
+      if (rescan) {
+        try {
+          await sweep();
+        } catch (e) {
+          return toolResult(null, `Error: rescan failed: ${e.message}`);
         }
-        out.push(entry);
+      } else {
+        await settleSweep();
       }
+      // Probed all at once, so offline agents cost one timeout in total, not one each.
+      const out = await Promise.all(agents().map(probeAgent));
       let last_updated_at = null;
       try {
-        last_updated_at = fs.statSync(SHARED_FILE).mtime.toISOString();
+        last_updated_at = nowStamp(fs.statSync(SHARED_FILE).mtime);
       } catch {
         // file might not exist yet
       }
@@ -650,7 +782,7 @@ const TOOLS = [
       const [result, err] = String(name_or_gpio).toLowerCase() === "all"
         ? await callAgent(agent, "GET", "/gpio/read")
         : await callAgent(agent, "GET", `/gpio/read/${name_or_gpio}`);
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -674,7 +806,7 @@ const TOOLS = [
       const body = { value: coerceValue(value) };
       if (duration !== undefined) body.duration = duration;
       const [result, err] = await callAgent(agent, "POST", `/gpio/write/${name_or_gpio}`, body);
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -682,7 +814,7 @@ const TOOLS = [
     description:
       "Scan all hardware GPIO pins on `agent` and return their value, type, pull resistor, " +
       "and name: BCM 2-27 on a Raspberry Pi, GP0-GP28 (minus the WiFi-reserved GP23/24/25/29) " +
-      "on a Pico. Only supported on Raspberry Pi / Pico hardware.",
+      "on a Pico, and every usable pin of the chip on an ESP32 (flash, PSRAM and USB pins are left out).",
     inputSchema: {
       type: "object",
       properties: { agent: { type: "string" } },
@@ -690,7 +822,7 @@ const TOOLS = [
     },
     handler: async ({ agent }) => {
       const [result, err] = await callAgent(agent, "GET", "/gpio/scan");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -717,7 +849,7 @@ const TOOLS = [
     },
     handler: async ({ agent, gpio, name, type, init, pullup, max, reversed, watched }) => {
       const body = {};
-      if (name !== undefined) body.name = name;
+      if (name !== undefined) body.name = asText(name);
       if (type !== undefined) body.type = type;
       if (init !== undefined) body.init = /^-?\d+$/.test(init) ? parseInt(init, 10) : init;
       if (pullup !== undefined) body.pullup = pullup;
@@ -725,7 +857,7 @@ const TOOLS = [
       if (reversed !== undefined) body.reversed = reversed;
       if (watched !== undefined) body.watched = watched;
       const [result, err] = await callAgent(agent, "POST", `/gpio/config/${gpio}`, body);
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -738,7 +870,7 @@ const TOOLS = [
     },
     handler: async ({ agent }) => {
       const [result, err] = await callAgent(agent, "GET", "/gpio/watched");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -748,7 +880,7 @@ const TOOLS = [
       "reading. `script` is \"<script-file> [args...]\": a bare filename in the agent's " +
       "scripts/ folder (no paths - that folder is the only allowed location), with " +
       "letters/digits-only arguments. On a Raspberry Pi it is a shell script run with `sh`; " +
-      "on a Pico a .py file the agent execs in-process. Pass remove=true to delete the sensor.",
+      "on a Pico or ESP32 a .py file the agent execs in-process. Pass remove=true to delete the sensor.",
     inputSchema: {
       type: "object",
       properties: {
@@ -761,10 +893,10 @@ const TOOLS = [
     },
     handler: async ({ agent, name, script, remove }) => {
       const body = {};
-      if (script !== undefined) body.script = script;
+      if (script !== undefined) body.script = asText(script);
       if (remove !== undefined) body.remove = remove;
       const [result, err] = await callAgent(agent, "POST", `/sensor/config/${name}`, body);
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -784,14 +916,14 @@ const TOOLS = [
       const [result, err] = name
         ? await callAgent(agent, "GET", `/sensor/read/${name}`)
         : await callAgent(agent, "GET", "/sensor/read");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
     name: "mcp_config_read",
     description:
       "Read `agent`'s global application configuration, grouped: `notifications` (`webhook` " +
-      "+ `webhook_key`), `bridges` (matter/homekit callbacks), `settings` (docs_enabled, logs_enabled, " +
+      "+ `webhook_key`), `bridges` (matter/homekit/homebridge callbacks), `settings` (docs_enabled, logs_enabled, " +
       "log_days), `sensors`, and configured pins (`gpios`). The `agent` block (platform, os, " +
       "ip, cpu_temperature, version) is computed live on every read and is not stored.",
     inputSchema: {
@@ -801,7 +933,7 @@ const TOOLS = [
     },
     handler: async ({ agent }) => {
       const [result, err] = await callAgent(agent, "GET", "/config/read");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -814,7 +946,7 @@ const TOOLS = [
       "shows them nested. log_days controls how long log entries are kept (0-30, clamped; 0 " +
       "clears the log immediately and keeps only the last hour). docs_enabled is Pi-only. " +
       "Changing api_key changes the agent's authentication key immediately, and also updates " +
-      "the local config.json file to match automatically.",
+      "the local agents-config.json file to match automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -831,24 +963,16 @@ const TOOLS = [
     },
     handler: async ({ agent, name, api_key, webhook_url, webhook_key, docs_enabled, logs_enabled, log_days }) => {
       const body = {};
-      if (name !== undefined) body.name = name;
-      if (api_key !== undefined) body.api_key = api_key;
-      if (webhook_url !== undefined) body.webhook_url = webhook_url;
-      if (webhook_key !== undefined) body.webhook_key = webhook_key;
+      if (name !== undefined) body.name = asText(name);
+      if (api_key !== undefined) body.api_key = asText(api_key);
+      if (webhook_url !== undefined) body.webhook_url = asText(webhook_url);
+      if (webhook_key !== undefined) body.webhook_key = asText(webhook_key);
       if (docs_enabled !== undefined) body.docs_enabled = docs_enabled;
       if (logs_enabled !== undefined) body.logs_enabled = logs_enabled;
       if (log_days !== undefined) body.log_days = log_days;
       const [result, err] = await callAgent(agent, "POST", "/config/update", body);
-      if (!err && api_key !== undefined) {
-        const config = loadSetupConfig();
-        const a = (config.agents || []).find((x) => x.name === agent);
-        if (a) {
-          a.api_key = api_key;
-          a.key_set = new Date().toISOString().replace("T", " ").substring(0, 19);
-          saveConfig(config);
-        }
-      }
-      return { content: [{ type: "text", text: err || result }] };
+      if (!err) await syncAgentEntry(agent, { name: body.name, api_key: body.api_key });
+      return toolResult(result, err);
     },
   },
   {
@@ -861,17 +985,21 @@ const TOOLS = [
       properties: { agent: { type: "string" }, config: { type: "object" } },
       required: ["agent", "config"],
     },
-    handler: async ({ agent, config }) => {
+    handler: async ({ agent, config: raw }) => {
+      const config = textFields(raw);
       const [result, err] = await callAgent(agent, "POST", "/config/load", config);
-      return { content: [{ type: "text", text: err || result }] };
+      // A loaded name or api_key replaces the agent's own, so record them like mcp_config_write.
+      if (!err && config && typeof config === "object") {
+        await syncAgentEntry(agent, { name: config.name, api_key: config.api_key });
+      }
+      return toolResult(result, err);
     },
   },
   {
     name: "mcp_agent_restart",
     description:
-      "Restart `agent`'s server process. Pass reboot=true to reboot the physical device " +
-      "instead - only honored on a real Raspberry Pi; on Mac/dev agents reboot is ignored and " +
-      "the process is restarted as usual.",
+      "Restart `agent`'s server process. Pass reboot=true to reboot the whole device instead " +
+      "(a Pi, Pico or ESP32); an agent running on a Mac ignores it and restarts the process.",
     inputSchema: {
       type: "object",
       properties: { agent: { type: "string" }, reboot: { type: "boolean" } },
@@ -879,12 +1007,15 @@ const TOOLS = [
     },
     handler: async ({ agent, reboot }) => {
       const [result, err] = await callAgent(agent, "POST", "/restart", { reboot: !!reboot });
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
     name: "mcp_agent_upgrade",
-    description: "Upgrade the agent in place: runs `install.sh --upgrade` (re-downloads the latest release files and reinstalls dependencies), then restarts the process so the new code takes effect.",
+    description:
+      "Upgrade `agent` to the latest release, then restart it. A Pi runs `install.sh --upgrade` " +
+      "(re-downloads the release files and reinstalls dependencies); a Pico or ESP32 downloads " +
+      "the new files over WiFi, swaps them in and resets.",
     inputSchema: {
       type: "object",
       properties: { agent: { type: "string" } },
@@ -892,7 +1023,7 @@ const TOOLS = [
     },
     handler: async ({ agent }) => {
       const [result, err] = await callAgent(agent, "POST", "/upgrade");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
   {
@@ -905,7 +1036,7 @@ const TOOLS = [
     },
     handler: async ({ agent }) => {
       const [result, err] = await callAgent(agent, "GET", "/logs");
-      return { content: [{ type: "text", text: err || result }] };
+      return toolResult(result, err);
     },
   },
 ];
@@ -978,7 +1109,8 @@ function runStdio() {
       if (resp) process.stdout.write(JSON.stringify(resp) + "\n");
     });
   });
-  rl.on("close", () => process.exit(0));
+  // stdin closed: finish the requests already read, then exit.
+  rl.on("close", () => { chain.then(() => process.exit(0)); });
 }
 
 // --- Streamable HTTP transport ---
@@ -991,8 +1123,7 @@ function keysMatch(provided, expected) {
 }
 
 function checkApiKey(req, apiKey) {
-  // Gates the Streamable HTTP transport on the Api-Key header. No-op when no key is set.
-  if (!apiKey) return true;
+  // Gates the Streamable HTTP transport on the Api-Key header.
   if (apiKey === DEFAULT_HTTP_KEY && adoptHttpKey(req.headers["api-key"])) return true;
   return keysMatch(req.headers["api-key"], apiKey);
 }
@@ -1015,6 +1146,17 @@ function adoptHttpKey(provided) {
   return true;
 }
 
+// Blocks DNS rebinding: a web page on a domain that resolves to this host reaches /mcp
+// as same-origin, so a browser request is accepted only from a localhost or IP-address
+// origin. MCP clients that are not browsers send no Origin header and always pass.
+function originAllowed(origin) {
+  if (origin === undefined) return true;
+  let host;
+  try { host = new URL(origin).hostname; } catch { return false; }
+  host = host.replace(/^\[|\]$/g, "");
+  return host === "localhost" || net.isIP(host) !== 0;
+}
+
 function sendJson(res, status, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), ...extraHeaders });
@@ -1025,8 +1167,13 @@ function runHttp(host, port) {
   // MCP Streamable HTTP at POST /mcp. We don't push server-initiated messages, so no SSE.
   // Stateful handshake is mocked: any session id (or none) is accepted.
   const server = http.createServer((req, res) => {
-    if (!new URL(req.url, "http://localhost").pathname.startsWith("/mcp")) {
+    const pathname = new URL(req.url, "http://localhost").pathname;
+    if (pathname !== "/mcp" && pathname !== "/mcp/") {
       res.writeHead(404).end();
+      return;
+    }
+    if (!originAllowed(req.headers.origin)) {
+      sendJson(res, 403, { error: "Origin not allowed" });
       return;
     }
     // httpKey() is evaluated per request so config rotation takes effect without restart.
@@ -1078,9 +1225,30 @@ function runHttp(host, port) {
       sendJson(res, 200, resp, headers);
     });
   });
+  server.on("error", (e) => {
+    const why = e.code === "EADDRINUSE" ? `port ${port} is already in use` : e.message;
+    console.error(`mcp-bridge: cannot listen on ${host}:${port}: ${why}`);
+    process.exit(1);
+  });
   server.listen(port, host, () => {
     console.log(`INFO:     mcp-bridge Streamable HTTP at http://${host}:${port}/mcp`);
   });
+}
+
+const ROTATE_KEYS = process.argv.slice(2).includes("--rotate-keys");
+let sweepPromise = null;   // the sweep in progress, if any
+
+// Starts a sweep, or joins the one already running.
+function sweep() {
+  if (!sweepPromise) {
+    sweepPromise = runSweep(ROTATE_KEYS).finally(() => { sweepPromise = null; });
+  }
+  return sweepPromise;
+}
+
+// Waits for a sweep in progress to finish; its failure is logged where it ran.
+async function settleSweep() {
+  if (sweepPromise) await sweepPromise.catch(() => {});
 }
 
 // One LAN sweep feeding every pass, in the order they have to run:
@@ -1089,55 +1257,39 @@ function runHttp(host, port) {
 //   3. add       - file whatever is left that isn't on record yet
 // Reconcile must go first: an agent that merely moved is not a new agent, and letting the
 // add pass see it before its address is repaired files it a second time as "<name>-<octet>".
-let sweeping = false;
-async function sweep(rotateKeys) {
-  if (sweeping) return;   // prevents concurrent execution if a sweep is already in progress
-  sweeping = true;
-  try {
-    const found = await scanForAgents();
-    await reconcileAgents(loadSetupConfig(), { rotate: rotateKeys, found });
-    if (rotateKeys) {
-      // Reconcile may have rewritten the file, so work from what is on disk now.
-      const fresh = loadSetupConfig();
-      if (await rotateConfiguredKeys(fresh)) saveConfig(fresh);
-    }
-    await searchAndAddAgents(rotateKeys, found);
-  } finally {
-    sweeping = false;
+async function runSweep(rotateKeys) {
+  const found = await scanForAgents();
+  await reconcileAgents(loadSetupConfig(), { rotate: rotateKeys, found });
+  if (rotateKeys) {
+    // Reconcile may have rewritten the file, so work from what is on disk now.
+    const fresh = loadSetupConfig();
+    if (await rotateConfiguredKeys(fresh)) saveConfig(fresh);
   }
+  await searchAndAddAgents(rotateKeys, found);
 }
 
 async function main() {
   const args = process.argv.slice(2);
-  const rotateKeys = args.includes("--rotate-keys");
-  let rescanMinutes = 60;
-  const rescanIdx = args.indexOf("--rescan");
-  if (rescanIdx !== -1 && rescanIdx + 1 < args.length) {
-    rescanMinutes = parseInt(args[rescanIdx + 1], 10);
-    if (isNaN(rescanMinutes)) rescanMinutes = 60;
-  }
+  // Read every flag first, so a usage error exits before anything starts.
+  const rescanMinutes = intFlag("--rescan", SWEEP_MINUTES, 0, 10080);
+  const httpMode = args.includes("--http");
+  // --http binds to all interfaces (LAN) by default; --local restricts it to loopback.
+  // An explicit --host <ip> wins over both.
+  const host = flagValue("--host") ?? (args.includes("--local") ? "127.0.0.1" : "0.0.0.0");
+  const port = intFlag("--port", 8315, 1, 65535);
   // Only --http has a console anyone reads; under stdio the client owns the pipe, so the
   // setup narration is suppressed there (security warnings still print, always).
   SETUP_QUIET = !args.includes("--http");
 
+  // The sweep runs in the background, so the transport answers at once; a tool that needs
+  // an agent the sweep has not filed yet waits for it (see callAgent and mcp_agents_list).
+  // --no-scan or --rescan 0 turns the automatic sweeps off, except on a first run.
+  const autoScan = !args.includes("--no-scan") && rescanMinutes > 0;
   const firstRun = !fs.existsSync(SHARED_FILE);
   if (firstRun) note(`No ${SHARED_FILE} found - scanning the network for agents.`);
-  // --no-scan disables the network sweep. However, if the config file is missing on the
-  // first run, a scan is enforced to discover initial agents.
-  if ((!args.includes("--no-scan") && rescanMinutes !== 0) || firstRun) {
-    await sweep(rotateKeys);
-  }
-  if (!args.includes("--no-scan") && rescanMinutes > 0) {
-    setInterval(() => { sweep(rotateKeys).catch((e) => note(`Sweep failed: ${e.message}`)); },
-                rescanMinutes * 60 * 1000).unref();
-  }
-
-  const httpMode = args.includes("--http");
-  // --http binds to all interfaces (LAN) by default; --local restricts it to loopback.
-  // An explicit --host <ip> wins over both.
-  let host = args.includes("--local") ? "127.0.0.1" : "0.0.0.0";
-  if (args.includes("--host")) host = args[args.indexOf("--host") + 1];
-  const port = args.includes("--port") ? parseInt(args[args.indexOf("--port") + 1], 10) : 8315;
+  const logFailure = (e) => note(`Sweep failed: ${e.message}`);
+  if (autoScan || firstRun) sweep().catch(logFailure);
+  if (autoScan) setInterval(() => sweep().catch(logFailure), rescanMinutes * 60 * 1000).unref();
 
   if (httpMode) runHttp(host, port);
   else runStdio();
