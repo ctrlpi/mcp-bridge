@@ -3,6 +3,7 @@
 # Several projects keep an identical copy of this file; change them all together.
 # `--port 0` takes a free port and prints it, so a test can read it back.
 import os
+import re
 import sys
 import json
 import time
@@ -129,6 +130,20 @@ class AgentHandler(BaseHTTPRequestHandler):
                     return self.send_error_json("Sensor not found", 404)
                 return self.send_json({s_name: self._mock_sensor_reading(s_name, sensors[s_name])})
 
+        if self.path == '/script/list':
+            return self.send_json({
+                "scripts": [{"name": n, "size": len(c.encode('utf-8')), "modified": "2026-01-01 00:00:00"}
+                            for n, c in sorted(self.server.scripts.items())],
+                "write": self._script_write_state()})
+
+        if self.path.startswith('/script/read/'):
+            s_name = self.path[len('/script/read/'):]
+            if not self._script_name_ok(s_name):
+                return self.send_error_json("script must be a bare filename in the scripts folder", 400)
+            if s_name not in self.server.scripts:
+                return self.send_error_json("Script not found", 404)
+            return self.send_json({"name": s_name, "content": self.server.scripts[s_name]})
+
         if self.path == '/gpio/watched':
             return self.send_json({"watched": []})
 
@@ -252,6 +267,39 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self.server.config.setdefault("sensors", {})[s_name] = body
             return self.send_json({"status": "configured"})
 
+        # Like the agents: writes need a non-default key and no write.lock, which a write
+        # may create but never change or remove. A run echoes its name and args.
+        if self.path.startswith('/script/write/'):
+            s_name = self.path[len('/script/write/'):]
+            if not self._script_name_ok(s_name):
+                return self.send_error_json("script must be a bare filename in the scripts folder", 400)
+            state = self._script_write_state()
+            if state == "locked":
+                return self.send_error_json("script writes are locked (write.lock in scripts/)", 403)
+            if state == "default_key":
+                return self.send_error_json("script writes need an api_key other than the default", 403)
+            if body.get("remove"):
+                existed = self.server.scripts.pop(s_name, None) is not None
+                return self.send_json({"name": s_name, "status": "removed" if existed else "not found"})
+            content = body.get("content")
+            if not isinstance(content, str):
+                return self.send_error_json("Send 'content' (text), or 'remove': true to delete the script", 400)
+            self.server.scripts[s_name] = content
+            return self.send_json({"name": s_name, "size": len(content.encode('utf-8'))})
+
+        if self.path.startswith('/script/run/'):
+            s_name = self.path[len('/script/run/'):]
+            if not self._script_name_ok(s_name):
+                return self.send_error_json("script must be a bare filename in the scripts folder", 400)
+            if s_name.lower() == "write.lock":
+                return self.send_error_json("write.lock is not a script", 400)
+            if s_name not in self.server.scripts:
+                return self.send_error_json("Script not found", 404)
+            args = [str(a) for a in body.get("args") or []]
+            if any(not re.fullmatch(r"[A-Za-z0-9]+", a) for a in args):
+                return self.send_error_json("script args must be letters and digits only", 400)
+            return self.send_json({"name": s_name, "exit_code": 0, "output": " ".join(["ran", s_name] + args)})
+
         if self.path == '/restart':
             return self.send_json({"status": "restarting"})
             
@@ -264,6 +312,16 @@ class AgentHandler(BaseHTTPRequestHandler):
         cfg = dict(self.server.config)
         cfg.pop('api_key', None)
         return cfg
+
+    def _script_name_ok(self, name):
+        return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,31}", name))
+
+    def _script_write_state(self):
+        if "write.lock" in self.server.scripts:
+            return "locked"
+        if self.server.config.get("api_key") == "your-secret-key":
+            return "default_key"
+        return "enabled"
 
     def _mock_sensor_reading(self, name, conf):
         script = conf.get("script", "")
@@ -289,6 +347,8 @@ def start_server(port, name, agent_type="pi"):
         "gpios": {},
         "sensors": {}
     }
+    # scripts/ as install.sh seeds it: one cpu-temp example (.sh on a Pi, .py on a board).
+    httpd.scripts = {"cpu-temp.sh": "echo 47.8\n"} if agent_type == "pi" else {"cpu-temp.py": "def read():\n    return 47.8\n"}
     httpd.state = {
         "gpios": {
             "13": {"value": 1},

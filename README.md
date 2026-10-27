@@ -1,7 +1,7 @@
 # ctrlPi MCP Bridge
 
 [![Platform: Cross-Platform](https://img.shields.io/badge/platform-Cross--Platform-006400.svg)](#requirements)
-[![Version 0.9.26](https://img.shields.io/badge/version-0.9.26-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
+[![Version 0.9.30](https://img.shields.io/badge/version-0.9.30-blue.svg)](https://github.com/ctrlpi/mcp-bridge/tags)
 [![Node 20+](https://img.shields.io/badge/node-20%2B-blue.svg)](https://nodejs.org/)
 [![Auth: Api-Key](https://img.shields.io/badge/auth-Api--Key-orange.svg)](#authentication)
 [![Agents: Pi, Pico & ESP32](https://img.shields.io/badge/agents-Pi%2C%20Pico%20%26%20ESP32-006400.svg)](#requirements)
@@ -177,6 +177,10 @@ Every tool except `mcp_agents_list` takes an `agent` argument naming an entry fr
 | `mcp_gpio_scan(agent)` | Scan every hardware pin (BCM 2-27 on a Pi, GP0-GP28 on a Pico, every usable pin of the chip on an ESP32). |
 | `mcp_sensor_config(agent, name, script, remove)` | Configure a named sensor. `script` is `"<file> [args...]"`: a bare filename in the agent's `scripts/` folder, letters/digits-only args. A shell script on a Pi, a `.py` the agent execs in-process on a Pico or ESP32. Pass `remove=true` to delete it. |
 | `mcp_sensor_read(agent, name)` | Read one sensor by name, or every configured sensor merged into one object when `name` is omitted. |
+| `mcp_script_list(agent)` | List the files in the agent's `scripts/` folder (`name`, `size`, `modified`), plus `write`: `enabled`, `default_key` (writes refused until the agent's key is changed) or `locked`. |
+| `mcp_script_read(agent, name)` | Read one file from `scripts/`. |
+| `mcp_script_write(agent, name, content, remove)` | Create or overwrite a file in `scripts/` (a bare filename of up to 32 characters), or delete it with `remove=true`. Refused while the agent has the default key or a `write.lock` file is there. Writing `write.lock` locks script writes, and this tool can't remove it; a script run with `mcp_script_run` can, as can a shell (Pi) or USB (Pico, ESP32). |
+| `mcp_script_run(agent, name, args)` | Run a file from `scripts/` and return `exit_code` and `output`: its stdout on a Pi (`.py` with Python, anything else with `sh`, 15 s limit), its `read(*args)` or `result` on a Pico or ESP32. Letters/digits-only args. Needs agents on 0.9.28 or later. |
 | `mcp_config_read(agent)` | Read the agent's full config: `notifications`, `bridges`, `settings`, `sensors`, `gpios`, plus the live `agent` block. |
 | `mcp_config_write(agent, name, api_key, webhook_url, webhook_key, docs_enabled, logs_enabled, log_days)` | Update config fields, named ungrouped (the agent routes each into its group). Changing the agent's `api_key` takes effect immediately, and the bridge automatically updates its entry in the shared `agents-config.json` to match. |
 | `mcp_config_load(agent, config)` | Load a whole config onto the agent. Pass `{}` to reset it, keeping only its API key. |

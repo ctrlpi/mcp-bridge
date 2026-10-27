@@ -812,8 +812,9 @@ const TOOLS = [
   {
     name: "mcp_gpio_scan",
     description:
-      "Scan all hardware GPIO pins on `agent` and return their value, type, pull resistor, " +
-      "and name: BCM 2-27 on a Raspberry Pi, GP0-GP28 (minus the WiFi-reserved GP23/24/25/29) " +
+      "Scan all hardware GPIO pins on `agent` and return each pin's level (the physical state), " +
+      "type, pull resistor and name; a reversed pin also reports `value` (its logical state) and " +
+      "`reversed`. Pins: BCM 2-27 on a Raspberry Pi, GP0-GP28 (minus the WiFi-reserved GP23/24/25/29) " +
       "on a Pico, and every usable pin of the chip on an ESP32 (flash, PSRAM and USB pins are left out).",
     inputSchema: {
       type: "object",
@@ -916,6 +917,87 @@ const TOOLS = [
       const [result, err] = name
         ? await callAgent(agent, "GET", `/sensor/read/${name}`)
         : await callAgent(agent, "GET", "/sensor/read");
+      return toolResult(result, err);
+    },
+  },
+  {
+    name: "mcp_script_list",
+    description:
+      "List the files in `agent`'s scripts/ folder (the folder sensors run from): `scripts` " +
+      "([{name, size, modified}]) and `write`: \"enabled\", \"default_key\" (writes are refused " +
+      "until the agent's api_key is changed from the default) or \"locked\" (a write.lock file " +
+      "there blocks every write).",
+    inputSchema: {
+      type: "object",
+      properties: { agent: { type: "string" } },
+      required: ["agent"],
+    },
+    handler: async ({ agent }) => {
+      const [result, err] = await callAgent(agent, "GET", "/script/list");
+      return toolResult(result, err);
+    },
+  },
+  {
+    name: "mcp_script_read",
+    description: "Read one file from `agent`'s scripts/ folder. Returns {name, content}.",
+    inputSchema: {
+      type: "object",
+      properties: { agent: { type: "string" }, name: { type: "string" } },
+      required: ["agent", "name"],
+    },
+    handler: async ({ agent, name }) => {
+      const [result, err] = await callAgent(agent, "GET", `/script/read/${encodeURIComponent(name)}`);
+      return toolResult(result, err);
+    },
+  },
+  {
+    name: "mcp_script_write",
+    description:
+      "Create or overwrite a file in `agent`'s scripts/ folder with `content`, or delete it with " +
+      "remove=true. `name` is a bare filename of up to 32 characters (letters, digits, . _ -, no " +
+      "leading dot or dash, no paths). Refused while the agent still has the default api_key, and " +
+      "once a write.lock file is in the folder. Writing write.lock (any content) locks every script " +
+      "write, and this tool can then no longer change or remove it. The lock does not stop runs: " +
+      "a script run with mcp_script_run that deletes files can remove write.lock, as can a shell " +
+      "(Pi) or USB (Pico, ESP32).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        name: { type: "string" },
+        content: { type: "string" },
+        remove: { type: "boolean" },
+      },
+      required: ["agent", "name"],
+    },
+    handler: async ({ agent, name, content, remove }) => {
+      const body = {};
+      if (content !== undefined) body.content = asText(content);
+      if (remove !== undefined) body.remove = remove;
+      const [result, err] = await callAgent(agent, "POST", `/script/write/${encodeURIComponent(name)}`, body);
+      return toolResult(result, err);
+    },
+  },
+  {
+    name: "mcp_script_run",
+    description:
+      "Run a file from `agent`'s scripts/ folder and return {name, exit_code, output}. On a " +
+      "Raspberry Pi a .py runs with the agent's Python and anything else with `sh`; output is its " +
+      "stdout (first 2 KB) and a run over 15 s is killed. On a Pico or ESP32 the file is exec'd " +
+      "in-process: output is what its read(*args) returns, or its `result`, and exit_code is 1 if it " +
+      "raised. `args` are letters and digits only.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string" },
+        name: { type: "string" },
+        args: { type: "array", items: { type: "string" } },
+      },
+      required: ["agent", "name"],
+    },
+    handler: async ({ agent, name, args }) => {
+      const body = args !== undefined ? { args: Array.isArray(args) ? args.map(asText) : args } : undefined;
+      const [result, err] = await callAgent(agent, "POST", `/script/run/${encodeURIComponent(name)}`, body);
       return toolResult(result, err);
     },
   },

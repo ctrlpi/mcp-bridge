@@ -235,6 +235,9 @@ async function runTestSet(client) {
     assert.ok(names.includes('mcp_agents_list'));
     assert.ok(names.includes('mcp_gpio_read'));
     assert.ok(names.includes('mcp_gpio_write'));
+    for (const t of ['mcp_script_list', 'mcp_script_read', 'mcp_script_write', 'mcp_script_run']) {
+      assert.ok(names.includes(t), t);
+    }
   });
 
   test('agents list', async () => {
@@ -405,6 +408,42 @@ async function runTestSet(client) {
 
       await client.callTool('mcp_config_load', { agent, config: { api_key: AGENT_KEY } });
       assert.equal(storedAgent(agent).api_key, AGENT_KEY);
+    });
+
+    test(`[${agent}] scripts: write refused on the default key, then write, read, run, remove`, async () => {
+      let data = parseToolResult(await client.callTool('mcp_script_list', { agent }));
+      assert.equal(data.write, 'default_key');
+      assert.ok(data.scripts.some(s => s.name.startsWith('cpu-temp.')));
+      let res = await client.callTool('mcp_script_write', { agent, name: 'hello.py', content: 'result = 1' });
+      assert.equal(res.isError, true);
+      assert.match(String(parseToolResult(res)), /403/);
+
+      await client.callTool('mcp_config_write', { agent, api_key: `script-key-${Date.now()}` });
+      try {
+        res = await client.callTool('mcp_script_write', { agent, name: 'hello.py', content: 'result = 1' });
+        assert.deepEqual(parseToolResult(res), { name: 'hello.py', size: 10 });
+        assert.equal(parseToolResult(await client.callTool('mcp_script_list', { agent })).write, 'enabled');
+        res = await client.callTool('mcp_script_read', { agent, name: 'hello.py' });
+        assert.deepEqual(parseToolResult(res), { name: 'hello.py', content: 'result = 1' });
+        // A numeric arg goes to the agent as text
+        res = await client.callTool('mcp_script_run', { agent, name: 'hello.py', args: ['a1', 22] });
+        assert.deepEqual(parseToolResult(res), { name: 'hello.py', exit_code: 0, output: 'ran hello.py a1 22' });
+        res = await client.callTool('mcp_script_write', { agent, name: 'hello.py', remove: true });
+        assert.equal(parseToolResult(res).status, 'removed');
+        res = await client.callTool('mcp_script_read', { agent, name: 'hello.py' });
+        assert.equal(res.isError, true);
+        assert.match(String(parseToolResult(res)), /404/);
+      } finally {
+        await client.callTool('mcp_config_write', { agent, api_key: AGENT_KEY });
+      }
+    });
+
+    test(`[${agent}] a script name with a path is refused`, async () => {
+      for (const name of ['../config.json', 'sub/x.py', '.hidden']) {
+        const res = await client.callTool('mcp_script_read', { agent, name });
+        assert.equal(res.isError, true, name);
+        assert.match(String(parseToolResult(res)), /400/, name);
+      }
     });
   }
 }

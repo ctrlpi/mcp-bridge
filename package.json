@@ -1,7 +1,7 @@
 {
   "name": "@ctrlpi/mcp-bridge",
-  "version": "0.9.26",
-  "description": "An MCP (Model Context Protocol) server that lets an AI agent (e.g. Claude Desktop) control one or more GPIO agents - `pi-gpio-api` Pis, `pico-gpio-api` Pico Ws or `esp32-gpio-api` ESP32s - by calling their REST API over HTTP.",
+  "version": "0.9.30",
+  "description": "An MCP (Model Context Protocol) server that lets an AI agent (e.g. Claude Desktop) control one or more GPIO agents (pi-gpio-api on a Raspberry Pi, pico-gpio-api on a Pico W or Pico 2 W, esp32-gpio-api on an ESP32) by calling their REST API over HTTP.",
   "main": "server.js",
   "files": [
     "server.js",
@@ -14,7 +14,8 @@
   "scripts": {
     "start": "node server.js",
     "run": "node server.js",
-    "test": "node --test test/mcp-bridge.test.js"
+    "test": "node --test test/mcp-bridge.test.js",
+    "prepublishOnly": "npm test"
   },
   "repository": {
     "type": "git",
@@ -25,15 +26,22 @@
     "model context protocol",
     "gpio",
     "raspberry pi",
-    "raspberry pi pico",
+    "raspberry-pi-pico",
     "raspberry pico",
-    "pi pico",
     "pico",
     "esp32",
     "claude",
     "ai",
     "llm",
-    "ctrlpi"
+    "ctrlpi",
+    "esp32-c3",
+    "esp32-s3",
+    "raspberry-pi",
+    "raspberry",
+    "pi",
+    "pico-pi",
+    "model-context-protocol",
+    "iot"
   ],
   "author": "ctrlPi",
   "license": "MIT",
